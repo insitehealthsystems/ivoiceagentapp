@@ -1,0 +1,15 @@
+{
+  "name": "ilocate-voice-client-web",
+  "version": "2.0.0",
+  "private": true,
+  "description": "iLocate Voice Client prototype: React web client + Node/Express backend, Microsoft Foundry agent, Azure Speech.",
+  "workspaces": ["client", "server"],
+  "scripts": {
+    "dev": "concurrently -n server,client -c green,cyan \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w server && npm run build -w client",
+    "test": "npm run test -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}
