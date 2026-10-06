@@ -47,29 +47,45 @@ export function startRecording(): RecordingHandle {
     stopRequested = true;
   };
 
+  // Created and resumed synchronously here, in the same call stack as the
+  // user's tap -- NOT after awaiting getUserMedia. Chrome's permission
+  // prompt is itself an async UI interaction; creating/resuming the
+  // AudioContext only after that await risks it staying 'suspended'
+  // indefinitely, which makes the AnalyserNode read flat silence forever
+  // (every sample reads as the midpoint/128, i.e. RMS 0) regardless of how
+  // loud the user actually speaks. This was the real bug behind "LISTENING
+  // runs the full no-speech timeout every time."
+  const audioContext = new AudioContext();
+  void audioContext.resume();
+
   void (async () => {
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (err) {
+      void audioContext.close();
       rejectResult(new MicrophoneUnavailableError(err instanceof Error ? err.message : String(err)));
       return;
     }
 
     if (stopRequested) {
       stream.getTracks().forEach((track) => track.stop());
+      void audioContext.close();
       rejectResult(new MicrophoneUnavailableError('Recording was stopped before it started.'));
       return;
     }
 
-    const audioContext = new AudioContext();
-    // Some browsers create a new AudioContext in a 'suspended' state unless
-    // it's resumed from within the original user-gesture call stack; since
-    // we get here after an `await` (getUserMedia), it may still be
-    // suspended, which would make the analyser read silence throughout and
-    // trigger the no-speech timeout below every time. Resuming explicitly
-    // is harmless if it's already running.
-    void audioContext.resume();
+    // Belt-and-suspenders: confirm it actually resumed, and retry once if
+    // not -- some browsers need the nudge to happen after the stream is
+    // granted too.
+    if (audioContext.state !== 'running') {
+      await audioContext.resume().catch(() => undefined);
+    }
+    if (audioContext.state !== 'running') {
+      // eslint-disable-next-line no-console -- intentional diagnostic for this known-tricky browser API
+      console.warn(`iLocate: AudioContext did not reach 'running' (state: ${audioContext.state}); volume detection may not work.`);
+    }
+
     const source = audioContext.createMediaStreamSource(stream);
     const analyser = audioContext.createAnalyser();
     analyser.fftSize = 512;
@@ -103,6 +119,8 @@ export function startRecording(): RecordingHandle {
     let speechDetected = false;
     let lastLoudAt = startedAt;
     let stopping = false;
+    let peakRmsSeen = 0;
+    let lastDiagnosticLogAt = 0;
 
     const requestStop = () => {
       if (stopping) return;
@@ -118,11 +136,20 @@ export function startRecording(): RecordingHandle {
         sumSquares += normalized * normalized;
       }
       const rms = Math.sqrt(sumSquares / timeDomainData.length);
+      peakRmsSeen = Math.max(peakRmsSeen, rms);
 
       const now = Date.now();
       if (rms > SILENCE_RMS_THRESHOLD) {
         speechDetected = true;
         lastLoudAt = now;
+      }
+
+      if (now - lastDiagnosticLogAt > 1000) {
+        lastDiagnosticLogAt = now;
+        // eslint-disable-next-line no-console -- intentional diagnostic for tuning SILENCE_RMS_THRESHOLD against real mics
+        console.debug(
+          `iLocate: mic level check -- current RMS ${rms.toFixed(4)}, peak so far ${peakRmsSeen.toFixed(4)}, threshold ${SILENCE_RMS_THRESHOLD}, contextState ${audioContext.state}`,
+        );
       }
 
       const elapsed = now - startedAt;
