@@ -14,7 +14,13 @@
 
 const SILENCE_RMS_THRESHOLD = 0.02;
 const SILENCE_DURATION_MS = 1200;
-const MIN_SPEECH_BEFORE_SILENCE_CHECK_MS = 500;
+// Safety nets only -- the real stop condition is speech-onset-then-silence
+// below, not a fixed grace period (a fixed period before the silence check
+// starts was the bug: it stopped ~1.7s in regardless of whether the user
+// had started talking yet, clipping most utterances short or capturing
+// nothing). If no speech is ever detected at all, give up after this long
+// rather than waiting the full MAX_RECORDING_DURATION_MS.
+const NO_SPEECH_TIMEOUT_MS = 6000;
 const MAX_RECORDING_DURATION_MS = 20_000;
 const SILENCE_POLL_INTERVAL_MS = 100;
 
@@ -57,6 +63,13 @@ export function startRecording(): RecordingHandle {
     }
 
     const audioContext = new AudioContext();
+    // Some browsers create a new AudioContext in a 'suspended' state unless
+    // it's resumed from within the original user-gesture call stack; since
+    // we get here after an `await` (getUserMedia), it may still be
+    // suspended, which would make the analyser read silence throughout and
+    // trigger the no-speech timeout below every time. Resuming explicitly
+    // is harmless if it's already running.
+    void audioContext.resume();
     const source = audioContext.createMediaStreamSource(stream);
     const analyser = audioContext.createAnalyser();
     analyser.fftSize = 512;
@@ -87,7 +100,15 @@ export function startRecording(): RecordingHandle {
 
     const startedAt = Date.now();
     const timeDomainData = new Uint8Array(analyser.fftSize);
+    let speechDetected = false;
     let lastLoudAt = startedAt;
+    let stopping = false;
+
+    const requestStop = () => {
+      if (stopping) return;
+      stopping = true;
+      recorder.stop();
+    };
 
     const silenceCheckInterval = setInterval(() => {
       analyser.getByteTimeDomainData(timeDomainData);
@@ -100,24 +121,29 @@ export function startRecording(): RecordingHandle {
 
       const now = Date.now();
       if (rms > SILENCE_RMS_THRESHOLD) {
+        speechDetected = true;
         lastLoudAt = now;
       }
 
       const elapsed = now - startedAt;
-      const silentFor = now - lastLoudAt;
-      if (
-        (elapsed > MIN_SPEECH_BEFORE_SILENCE_CHECK_MS && silentFor > SILENCE_DURATION_MS) ||
-        elapsed > MAX_RECORDING_DURATION_MS
-      ) {
-        recorder.stop();
+      if (speechDetected) {
+        // Stop once the user has been quiet for a bit *after* having
+        // actually spoken -- not from an arbitrary fixed point after tap.
+        if (now - lastLoudAt > SILENCE_DURATION_MS) {
+          requestStop();
+        }
+      } else if (elapsed > NO_SPEECH_TIMEOUT_MS) {
+        // Never heard anything at all -- stop and let the server report
+        // "no speech recognized" rather than waiting the full max duration.
+        requestStop();
+      }
+
+      if (elapsed > MAX_RECORDING_DURATION_MS) {
+        requestStop();
       }
     }, SILENCE_POLL_INTERVAL_MS);
 
-    stopFn = () => {
-      if (recorder.state !== 'inactive') {
-        recorder.stop();
-      }
-    };
+    stopFn = () => requestStop();
 
     if (stopRequested) {
       // Stopped before recording actually started (extremely unlikely --
